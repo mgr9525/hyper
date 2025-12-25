@@ -216,6 +216,16 @@ where
     pub fn is_extended_connect_protocol_enabled(&self) -> bool {
         self.inner.1.is_extended_connect_protocol_enabled()
     }
+
+    /// Returns the current max send streams
+    pub fn current_max_send_streams(&self) -> usize {
+        self.inner.1.current_max_send_streams()
+    }
+
+    /// Returns the current max send streams
+    pub fn current_max_recv_streams(&self) -> usize {
+        self.inner.1.current_max_recv_streams()
+    }
 }
 
 impl<T, B, E> fmt::Debug for Connection<T, B, E>
