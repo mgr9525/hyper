@@ -13,6 +13,8 @@ use crate::rt::{Read, Write};
 use futures_core::ready;
 use http::{Request, Response};
 
+pub use h2::client::ConnInfo;
+
 use super::super::dispatch::{self, TrySendError};
 use crate::body::{Body, Incoming as IncomingBody};
 use crate::common::time::Time;
@@ -263,6 +265,11 @@ where
     /// [1]: https://datatracker.ietf.org/doc/html/rfc7540#section-5.1.2
     pub fn current_max_recv_streams(&self) -> usize {
         self.inner.1.current_max_recv_streams()
+    }
+
+    /// Returns a snapshot of connection and stream-level telemetry.
+    pub fn get_conn_info(&self) -> ConnInfo {
+        self.inner.1.get_conn_info()
     }
 }
 

@@ -12,7 +12,7 @@ use bytes::Bytes;
 use futures_channel::mpsc::{Receiver, Sender};
 use futures_channel::{mpsc, oneshot};
 use futures_core::{ready, FusedFuture, FusedStream, Stream};
-use h2::client::{Builder, Connection, SendRequest};
+use h2::client::{Builder, ConnInfo, Connection, SendRequest};
 use h2::SendStream;
 use http::{Method, StatusCode};
 use pin_project_lite::pin_project;
@@ -452,6 +452,9 @@ where
     }
     pub(crate) fn current_max_recv_streams(&self) -> usize {
         self.h2_tx.current_max_recv_streams()
+    }
+    pub(crate) fn get_conn_info(&self) -> ConnInfo {
+        self.h2_tx.get_conn_info()
     }
 }
 
