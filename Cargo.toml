@@ -31,7 +31,7 @@ atomic-waker = { version = "1.1.2", optional = true }
 futures-channel = { version = "0.3", optional = true }
 futures-core = { version = "0.3.31", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
-h2 = { git = "https://github.com/mgr9525/h2.git", rev = "c7ab3be6e5f2ae746c39010657b60f789a6013f5", optional = true }
+h2 = { git = "https://github.com/mgr9525/h2.git", rev = "56812ac0f9684ef9f3a8fe4888b74a4f4710cb98", optional = true }
 # h2 ={ path = "../h2", optional = true }
 # h2 = { version = "0.4.14", optional = true }
 http-body-util = { version = "0.1", optional = true }
