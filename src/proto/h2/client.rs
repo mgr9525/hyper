@@ -379,7 +379,7 @@ pin_project! {
         },
         Send {
             #[pin]
-            send_when: SendWhen<B, E>,
+            send_when: SendWhen<B, E, T>,
         },
         Task {
             #[pin]
@@ -408,6 +408,16 @@ where
     }
 }
 
+fn spawn_pipe<B, T, E>(exec: &mut E, pipe: PipeMap<B>)
+where
+    B: Body + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    T: Read + Write + Unpin,
+    E: Http2ClientConnExec<B, T>,
+{
+    exec.execute_h2_future(H2ClientFuture::Pipe { pipe });
+}
+
 struct FutCtx<B>
 where
     B: Body,
@@ -416,7 +426,7 @@ where
     eos: bool,
     fut: ResponseFuture,
     body_tx: SendStream<SendBuf<B::Data>>,
-    body: B,
+    request: Request<B>,
     cb: Callback<Request<B>, Response<IncomingBody>>,
 }
 
@@ -526,54 +536,27 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     T: Read + Write + Unpin,
 {
-    fn poll_pipe(&mut self, f: FutCtx<B>, cx: &mut Context<'_>) {
+    fn poll_pipe(&mut self, f: FutCtx<B>, _cx: &mut Context<'_>) {
         let ping = self.ping.clone();
-
-        // A one-shot channel so that send_task can tell pipe_task to
-        // reset the stream when the client cancels the request.
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-
-        let send_stream = if !f.is_connect {
-            if !f.eos {
-                let mut pipe = PipeToSendStream::new(f.body, f.body_tx);
-
-                // eagerly see if the body pipe is ready and
-                // can thus skip allocating in the executor
-                match Pin::new(&mut pipe).poll(cx) {
-                    Poll::Ready(_) => (),
-                    Poll::Pending => {
-                        let conn_drop_ref = self.conn_drop_ref.clone();
-                        // keep the ping recorder's knowledge of an
-                        // "open stream" alive while this body is
-                        // still sending...
-                        let ping = ping.clone();
-
-                        let pipe = PipeMap {
-                            pipe,
-                            conn_drop_ref: Some(conn_drop_ref),
-                            ping: Some(ping),
-                            cancel_rx: Some(cancel_rx),
-                        };
-                        // Clear send task
-                        self.executor
-                            .execute_h2_future(H2ClientFuture::Pipe { pipe });
-                    }
-                }
-            }
-
-            None
-        } else {
-            Some(f.body_tx)
-        };
 
         self.executor.execute_h2_future(H2ClientFuture::Send {
             send_when: SendWhen {
                 when: ResponseFutMap {
                     fut: f.fut,
+                    request: Some(f.request),
+                    is_connect: f.is_connect,
+                    eos: f.eos,
+                    body_tx: Some(f.body_tx),
                     ping: Some(ping),
-                    send_stream: Some(send_stream),
+                    send_stream: Some(None),
+                    body_started: false,
+                    conn_drop_ref: self.conn_drop_ref.clone(),
                     exec: self.executor.clone(),
+                    spawn_pipe: spawn_pipe::<B, T, E>,
                     cancel_tx: Some(cancel_tx),
+                    cancel_rx: Some(cancel_rx),
+                    marker: PhantomData,
                 },
                 call_back: Some(f.cb),
             },
@@ -582,41 +565,105 @@ where
 }
 
 pin_project! {
-    pub(crate) struct ResponseFutMap<B, E>
+    pub(crate) struct ResponseFutMap<B, E, T>
     where
         B: Body,
         B: 'static,
     {
         #[pin]
         fut: ResponseFuture,
+        request: Option<Request<B>>,
+        is_connect: bool,
+        eos: bool,
+        body_tx: Option<SendStream<SendBuf<<B as Body>::Data>>>,
         ping: Option<Recorder>,
         #[pin]
         send_stream: Option<Option<SendStream<SendBuf<<B as Body>::Data>>>>,
+        body_started: bool,
+        conn_drop_ref: Sender<Infallible>,
         exec: E,
+        spawn_pipe: fn(&mut E, PipeMap<B>),
         cancel_tx: Option<oneshot::Sender<()>>,
+        cancel_rx: Option<oneshot::Receiver<()>>,
+        marker: PhantomData<T>,
     }
 }
 
-impl<B: Body + 'static, E> ResponseFutMap<B, E> {
+impl<B: Body + 'static, E, T> ResponseFutMap<B, E, T> {
     /// Signal the `pipe_task` to reset the stream (e.g. on client cancellation).
     pub(crate) fn cancel(self: Pin<&mut Self>) {
-        if let Some(cancel_tx) = self.project().cancel_tx.take() {
+        let this = self.project();
+        if !*this.body_started {
+            if let Some(mut body_tx) = this.body_tx.take() {
+                body_tx.send_reset(h2::Reason::CANCEL);
+            }
+            this.cancel_tx.take();
+            this.cancel_rx.take();
+        } else if let Some(cancel_tx) = this.cancel_tx.take() {
             let _ = cancel_tx.send(());
         }
     }
+
+    fn start_body(self: Pin<&mut Self>)
+    where
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let mut this = self.project();
+        if *this.body_started {
+            return;
+        }
+        *this.body_started = true;
+
+        let request = this.request.take().expect("request missing before body start");
+        let (_parts, body) = request.into_parts();
+        let body_tx = this.body_tx.take().expect("body stream missing");
+
+        if *this.is_connect {
+            this.send_stream.set(Some(Some(body_tx)));
+            return;
+        }
+
+        if *this.eos {
+            drop(body_tx);
+            return;
+        }
+
+        let pipe = PipeMap {
+            pipe: PipeToSendStream::new(body, body_tx),
+            conn_drop_ref: Some(this.conn_drop_ref.clone()),
+            ping: Some(this.ping.as_ref().expect("ping missing").clone()),
+            cancel_rx: this.cancel_rx.take(),
+        };
+        (this.spawn_pipe)(this.exec, pipe);
+    }
 }
 
-impl<B, E> Future for ResponseFutMap<B, E>
+impl<B, E, T> Future for ResponseFutMap<B, E, T>
 where
     B: Body + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     E: Http2UpgradedExec<B::Data>,
 {
     type Output = Result<Response<crate::body::Incoming>, (crate::Error, Option<Request<B>>)>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.as_mut().project();
+        let result = match self.as_mut().project().fut.poll(cx) {
+            Poll::Ready(result) => result,
+            Poll::Pending => {
+                if self.as_mut().project().fut.is_request_head_sent() {
+                    self.as_mut().start_body();
+                } else if self.as_mut().project().fut.poll_request_head_sent(cx).is_ready() {
+                    self.as_mut().start_body();
+                }
+                return Poll::Pending;
+            }
+        };
 
-        let result = ready!(this.fut.poll(cx));
+        let head_sent = self.as_mut().project().fut.is_request_head_sent();
+        if result.is_ok() {
+            self.as_mut().start_body();
+        }
+        let mut this = self.as_mut().project();
 
         let ping = this.ping.take().expect("Future polled twice");
         let send_stream = this.send_stream.take().expect("Future polled twice");
@@ -659,10 +706,22 @@ where
                 }
             }
             Err(err) => {
-                ping.ensure_not_timed_out().map_err(|e| (e, None))?;
+                if let Err(timeout) = ping.ensure_not_timed_out() {
+                    let request = if !head_sent {
+                        this.request.take()
+                    } else {
+                        None
+                    };
+                    return Poll::Ready(Err((timeout, request)));
+                }
 
                 debug!("client response error: {}", err);
-                Poll::Ready(Err((crate::Error::new_h2(err), None::<Request<B>>)))
+                let request = if !head_sent && !err.is_user() {
+                    this.request.take()
+                } else {
+                    None
+                };
+                Poll::Ready(Err((crate::Error::new_h2(err), request)))
             }
         }
     }
@@ -680,10 +739,30 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            match ready!(self.h2_tx.poll_ready(cx)) {
-                Ok(()) => (),
-                Err(err) => {
-                    self.ping.ensure_not_timed_out()?;
+            match self.h2_tx.poll_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => (),
+                Poll::Ready(Err(err)) => {
+                    let timeout = self.ping.ensure_not_timed_out().err();
+                    if let Some(mut f) = self.fut_ctx.take() {
+                        let return_request = !f.fut.is_request_head_sent() && !err.is_user();
+                        if return_request {
+                            f.body_tx.send_reset(h2::Reason::CANCEL);
+                        }
+                        let message = if return_request {
+                            Some(f.request)
+                        } else {
+                            None
+                        };
+                        f.cb.send(Err(TrySendError {
+                            error: timeout.unwrap_or_else(|| crate::Error::new_h2(err)),
+                            message,
+                        }));
+                        return Poll::Ready(Ok(Dispatched::Shutdown));
+                    }
+                    if let Some(timeout) = timeout {
+                        return Poll::Ready(Err(timeout));
+                    }
                     return if err.reason() == Some(::h2::Reason::NO_ERROR) {
                         trace!("connection gracefully shutdown");
                         Poll::Ready(Ok(Dispatched::Shutdown))
@@ -708,16 +787,18 @@ where
                         continue;
                     }
                     let (head, body) = req.into_parts();
+                    let body_len = body.size_hint().exact();
+                    let eos = body.is_end_stream();
+                    let original = ::http::Request::from_parts(head.clone(), body);
                     let mut req = ::http::Request::from_parts(head, ());
                     super::strip_connection_headers(req.headers_mut(), super::MessageKind::Request);
-                    if let Some(len) = body.size_hint().exact() {
+                    if let Some(len) = body_len {
                         if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
                             headers::set_content_length_if_missing(req.headers_mut(), len);
                         }
                     }
 
                     let is_connect = req.method() == Method::CONNECT;
-                    let eos = body.is_end_stream();
 
                     if is_connect
                         && headers::content_length_parse_all(req.headers())
@@ -739,20 +820,25 @@ where
                         Ok(ok) => ok,
                         Err(err) => {
                             debug!("client send request error: {}", err);
+                            let message = if !err.is_user() {
+                                Some(original)
+                            } else {
+                                None
+                            };
                             cb.send(Err(TrySendError {
                                 error: crate::Error::new_h2(err),
-                                message: None,
+                                message,
                             }));
                             continue;
                         }
                     };
 
-                    let f = FutCtx {
+                    let mut f = FutCtx {
                         is_connect,
                         eos,
                         fut,
                         body_tx,
-                        body,
+                        request: original,
                         cb,
                     };
 
@@ -767,9 +853,17 @@ where
                         }
                         Poll::Ready(Ok(())) => (),
                         Poll::Ready(Err(err)) => {
+                            let return_request = !f.fut.is_request_head_sent() && !err.is_user();
+                            if return_request {
+                                f.body_tx.send_reset(h2::Reason::CANCEL);
+                            }
                             f.cb.send(Err(TrySendError {
                                 error: crate::Error::new_h2(err),
-                                message: None,
+                                message: if return_request {
+                                    Some(f.request)
+                                } else {
+                                    None
+                                },
                             }));
                             continue;
                         }

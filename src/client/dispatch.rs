@@ -12,6 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "http2")]
 use crate::{body::Incoming, proto::h2::client::ResponseFutMap};
+#[cfg(feature = "http2")]
+use crate::rt::bounds::Http2UpgradedExec;
 
 pub(crate) type RetryPromise<T, U> = oneshot::Receiver<Result<U, TrySendError<T>>>;
 pub(crate) type Promise<T> = oneshot::Receiver<Result<T, crate::Error>>;
@@ -331,23 +333,24 @@ impl<T> TrySendError<T> {
 
 #[cfg(feature = "http2")]
 pin_project! {
-    pub struct SendWhen<B, E>
+    pub struct SendWhen<B, E, T>
     where
         B: Body,
         B: 'static,
     {
         #[pin]
-        pub(crate) when: ResponseFutMap<B, E>,
+        pub(crate) when: ResponseFutMap<B, E, T>,
         #[pin]
         pub(crate) call_back: Option<Callback<Request<B>, Response<Incoming>>>,
     }
 }
 
 #[cfg(feature = "http2")]
-impl<B, E> Future for SendWhen<B, E>
+impl<B, E, T> Future for SendWhen<B, E, T>
 where
     B: Body + 'static,
-    E: crate::rt::bounds::Http2UpgradedExec<B::Data>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    E: Http2UpgradedExec<B::Data>,
 {
     type Output = ();
 
