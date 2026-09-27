@@ -683,6 +683,7 @@ where
             match ready!(self.h2_tx.poll_ready(cx)) {
                 Ok(()) => (),
                 Err(err) => {
+                    self.req_rx.close();
                     self.ping.ensure_not_timed_out()?;
                     return if err.reason() == Some(::h2::Reason::NO_ERROR) {
                         trace!("connection gracefully shutdown");
@@ -767,6 +768,7 @@ where
                         }
                         Poll::Ready(Ok(())) => (),
                         Poll::Ready(Err(err)) => {
+                            self.req_rx.close();
                             f.cb.send(Err(TrySendError {
                                 error: crate::Error::new_h2(err),
                                 message: None,
@@ -788,6 +790,7 @@ where
                     #[allow(unused)]
                     Ok(never) => match never {},
                     Err(_conn_is_eof) => {
+                        self.req_rx.close();
                         trace!("connection task is closed, closing dispatch task");
                         return Poll::Ready(Ok(Dispatched::Shutdown));
                     }

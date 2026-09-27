@@ -2371,6 +2371,48 @@ mod conn {
     }
 
     #[tokio::test]
+    async fn try_send_request_rejects_after_connection_error_is_observed() {
+        let (io_srv, mut io_handle) = tokio_test::io::Builder::new()
+            .write(b"GET / HTTP/1.1\r\n\r\n")
+            .read(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .build_with_handle();
+
+        let io = TokioIo::new(io_srv);
+        let (mut client, conn) = conn::http1::Builder::new()
+            .handshake::<_, Empty<Bytes>>(io)
+            .await
+            .expect("http handshake");
+        let conn_task = tokio::spawn(async move { conn.await });
+
+        let response = client
+            .send_request(http::Request::new(Empty::new()))
+            .await
+            .expect("resp 1");
+        assert_eq!(response.status(), 200);
+
+        io_handle.read_error(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+
+        let connection_result = conn_task.await.expect("connection task panicked");
+        assert!(
+            connection_result.is_err(),
+            "connection should report the I/O error"
+        );
+        assert!(
+            client.is_closed(),
+            "sender should close before the connection future returns"
+        );
+
+        let mut err = client
+            .try_send_request(http::Request::new(Empty::new()))
+            .await
+            .expect_err("closed sender should reject the request");
+        assert!(err.take_message().is_some(), "request should be returned");
+    }
+
+    #[tokio::test]
     async fn http2_detect_conn_eof() {
         use futures_util::future;
 
@@ -2449,6 +2491,12 @@ mod conn {
         future::poll_fn(|ctx| client.poll_ready(ctx))
             .await
             .expect_err("client should be closed");
+
+        let mut err = client
+            .try_send_request(Request::new(Empty::<Bytes>::new()))
+            .await
+            .expect_err("closed sender should reject the request");
+        assert!(err.take_message().is_some(), "request should be returned");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

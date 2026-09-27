@@ -721,6 +721,10 @@ cfg_client! {
                     }
                 }
                 Err(err) => {
+                    // Mark the sender closed before waking any request waiting on this error.
+                    // This prevents a newly submitted request from being queued while the
+                    // connection future is unwinding.
+                    self.rx.close();
                     if let Some(cb) = self.callback.take() {
                         cb.send(Err(TrySendError {
                             error: err,
@@ -728,7 +732,6 @@ cfg_client! {
                         }));
                         Ok(())
                     } else if !self.rx_closed {
-                        self.rx.close();
                         if let Some((req, cb)) = self.rx.try_recv() {
                             trace!("canceling queued request with connection error: {}", err);
                             // in this case, the message was never even started, so it's safe to tell

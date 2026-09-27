@@ -129,6 +129,10 @@ impl<B> SendRequest<B> {
     }
 
     /// Checks if the connection side has been closed.
+    ///
+    /// This becomes true once the connection task observes a terminal error or
+    /// shutdown. It does not perform an I/O probe and cannot detect a silent
+    /// network failure that the operating system has not reported.
     pub fn is_closed(&self) -> bool {
         self.dispatch.is_closed()
     }
@@ -190,7 +194,9 @@ where
     /// # Errors
     ///
     /// If there was an error before trying to serialize the request to the
-    /// connection, the message will be returned as part of this error.
+    /// connection, the message will be returned as part of this error. If the
+    /// connection is already known to be closed, the request is rejected before
+    /// it is queued.
     #[allow(clippy::result_large_err)]
     pub fn try_send_request(
         &mut self,

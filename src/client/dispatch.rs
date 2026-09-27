@@ -191,7 +191,6 @@ impl<T, U> Receiver<T, U> {
         }
     }
 
-    #[cfg(feature = "http1")]
     pub(crate) fn close(&mut self) {
         self.taker.cancel();
         self.inner.close();
